@@ -7,6 +7,7 @@
 # - Auto-detects venvs and exports VIRTUAL_ENV for subprocesses
 # - Temporary version override with 'setpy <version>'
 # - Build mode for pip access with 'setpy <version> --build'
+#   (Build mode auto-clears in new shell sessions)
 #
 # LIMITATIONS (Fundamental OS restrictions):
 # - Wrapper functions ONLY work in interactive shells where you type commands
@@ -29,9 +30,108 @@ typeset -g _LAST_VIRTUAL_ENV=""
 typeset -g _PYTHONS_SCANNED=0
 typeset -g _PYTHON_OVERRIDE=""
 typeset -gi _PYTHON_MANAGER_READY=0
-typeset -g _PYTHON_SYMLINK_DIR="$HOME/.local/bin"
-typeset -g _PYTHON_SYMLINK_MANAGED=0
 typeset -g _PYTHON_BUILD_MODE=0
+typeset -g _PYMANAGER_LAST_SET_BIN_DIR=""
+typeset -g _PYMANAGER_LAST_WRAPPER_DIR=""
+typeset -gi _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
+typeset -g _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
+
+# === EARLY PATH SETUP (runs on source, before functions are defined) ===
+# This ensures login shells get correct PATH even without full function loading.
+# Idempotent: safe to source multiple times.
+#
+# IMPORTANT: We must run this setup if:
+#   1. First time sourcing (_PYMANAGER_PATH_INIT not set), OR
+#   2. VIRTUAL_ENV is set but its bin is NOT at the FRONT of PATH
+#   3. CONDA_PREFIX is set but its bin is NOT at the FRONT of PATH
+#
+# This fixes the bug where Codex/cursor-agent spawn subshells that inherit
+# _PYMANAGER_PATH_INIT but have wrong PATH ordering (venv bin after /usr/bin).
+{
+  local _pymanager_needs_path_fix=0
+
+  # Check if we need to run the path setup
+  if [[ -z "${_PYMANAGER_PATH_INIT:-}" ]]; then
+    _pymanager_needs_path_fix=1
+  elif [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+    # VIRTUAL_ENV is set - check if its bin is at the FRONT of PATH (not just present)
+    # This catches the case where subshells inherit _PYMANAGER_PATH_INIT but have
+    # wrong PATH ordering (e.g., /usr/bin before venv bin)
+    local _first_path="${PATH%%:*}"
+    local _second_path=""
+    local _rest="${PATH#*:}"
+    [[ "$_rest" != "$PATH" ]] && _second_path="${_rest%%:*}"
+
+    # Venv bin should be first, OR second if a pymanager wrapper is first
+    if [[ "$_first_path" == "$VIRTUAL_ENV/bin" ]]; then
+      : # OK - venv is first
+    elif [[ "$_first_path" =~ ^/tmp/pymanager-[0-9]+/bin$ ]] && \
+         [[ "$_second_path" == "$VIRTUAL_ENV/bin" ]]; then
+      : # OK - pymanager wrapper first, venv second
+    else
+      _pymanager_needs_path_fix=1
+    fi
+  elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
+    # CONDA_PREFIX is set - same logic as VIRTUAL_ENV
+    local _first_path="${PATH%%:*}"
+    local _second_path=""
+    local _rest="${PATH#*:}"
+    [[ "$_rest" != "$PATH" ]] && _second_path="${_rest%%:*}"
+
+    if [[ "$_first_path" == "$CONDA_PREFIX/bin" ]]; then
+      : # OK - conda is first
+    elif [[ "$_first_path" =~ ^/tmp/pymanager-[0-9]+/bin$ ]] && \
+         [[ "$_second_path" == "$CONDA_PREFIX/bin" ]]; then
+      : # OK - pymanager wrapper first, conda second
+    else
+      _pymanager_needs_path_fix=1
+    fi
+  fi
+
+  if (( _pymanager_needs_path_fix )); then
+    export _PYMANAGER_PATH_INIT=1
+    
+    # First, check if there's already a pymanager wrapper directory in PATH (from setpy in parent shell)
+    # We need to preserve its position at the front
+    local _pymanager_existing_wrapper=""
+    local dir
+    for dir in $path; do
+      if [[ "$dir" =~ ^/tmp/pymanager-[0-9]+/bin$ ]]; then
+        _pymanager_existing_wrapper="$dir"
+        break
+      fi
+    done
+    
+    if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+      # Venv active - ensure venv's bin is first
+      path=("$VIRTUAL_ENV/bin" ${path:#"$VIRTUAL_ENV/bin"})
+    elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
+      # Conda active - ensure conda's bin is first
+      path=("$CONDA_PREFIX/bin" ${path:#"$CONDA_PREFIX/bin"})
+    elif [[ -d "$HOME/opt/python" ]]; then
+      # No venv/conda - find latest Python in ~/opt/python/
+      _pymanager_init_bin=$(find "$HOME/opt/python" -maxdepth 2 -type d -name bin 2>/dev/null | sort -t/ -k6 -V | tail -1)
+      if [[ -n "$_pymanager_init_bin" ]] && [[ -d "$_pymanager_init_bin" ]]; then
+        path=("$_pymanager_init_bin" ${path:#"$_pymanager_init_bin"})
+      fi
+      unset _pymanager_init_bin
+    fi
+    
+    # ~/.local/bin always early (user scripts)
+    if [[ -d "$HOME/.local/bin" ]]; then
+      path=("$HOME/.local/bin" ${path:#"$HOME/.local/bin"})
+    fi
+    
+    # If there was an existing pymanager wrapper, put it back at the very front
+    # This preserves setpy's configuration when subshells are spawned
+    if [[ -n "$_pymanager_existing_wrapper" ]] && [[ -d "$_pymanager_existing_wrapper" ]]; then
+      path=("$_pymanager_existing_wrapper" ${path:#"$_pymanager_existing_wrapper"})
+    fi
+    unset _pymanager_existing_wrapper
+    
+    export PATH="${(j/:/)path}"
+  fi
+}
 
 # Comprehensive Python scanner - lazy loaded
 _scan_all_pythons() {
@@ -70,27 +170,25 @@ _scan_all_pythons() {
     local python_executables=()
     
     for pattern in "${search_paths[@]}"; do
+        # Debug: show patterns being searched
+        [[ -n "${PYMANAGER_DEBUG:-}" ]] && echo "[pymanager debug] Searching pattern: $pattern" >&2
         for dir in ${~pattern}(N/); do
             [[ -d "$dir" ]] || continue
+            [[ -n "${PYMANAGER_DEBUG:-}" ]] && echo "[pymanager debug]   Found dir: $dir" >&2
             
             # Find ALL python executables
             for py in "$dir"/python*(N); do
                 [[ -x "$py" ]] || continue
                 [[ "$py" =~ "python-config" ]] && continue
                 [[ "$py" =~ "pythonw" ]] && continue
-                
-                # Skip managed symlinks in ~/.local/bin (we created these)
-                if [[ "${py%/*}" == "$_PYTHON_SYMLINK_DIR" ]] && [[ -L "$py" ]]; then
-                    continue
-                fi
-                
+
                 python_executables+=("$py")
             done
         done
     done
     
     # Second pass: get version info for each executable
-    for py in $python_executables; do
+    for py in "${python_executables[@]}"; do
         # Try to get version
         local version=""
         local fullver=""
@@ -108,17 +206,19 @@ _scan_all_pythons() {
             fi
             if [[ "$fullver" =~ 'Python ([0-9]+)\.([0-9]+)\.?[0-9]*' ]]; then
                 local extracted_version="${match[1]}.${match[2]}"
-                
+
                 if [[ -z "$version" ]]; then
                     version="$extracted_version"
                 fi
-                
+
                 # Skip Python 2
                 if [[ "${match[1]}" == "2" ]]; then
                     continue
                 fi
             fi
         else
+            # Debug: show which pythons fail to execute (only if PYMANAGER_DEBUG is set)
+            [[ -n "${PYMANAGER_DEBUG:-}" ]] && echo "[pymanager debug] Failed to execute: $py ($fullver)" >&2
             continue
         fi
         
@@ -202,6 +302,7 @@ _in_virtual_env() {
     [[ -n "$VIRTUAL_ENV" ]] && return 0
 
     # Conda
+    [[ -n "$CONDA_PREFIX" ]] && return 0
     [[ -n "$CONDA_DEFAULT_ENV" ]] && return 0
 
     # Poetry
@@ -212,8 +313,8 @@ _in_virtual_env() {
 
     # Heuristic: Check if python command points to a venv-like structure
     # This helps detect venvs created by sandboxed environments
-    # Use type -p to get actual binary path (command -v returns function name if defined)
-    local python_path=$(type -p python 2>/dev/null)
+    # Use whence -p to get actual binary path (command -v returns function name if defined)
+    local python_path=$(whence -p python 2>/dev/null)
     if [[ -n "$python_path" ]] && [[ -x "$python_path" ]]; then
         # Check if python is in a bin/ directory with activate script
         if [[ "$python_path" =~ /bin/python ]]; then
@@ -231,6 +332,32 @@ _in_virtual_env() {
     fi
 
     return 1
+}
+
+# Get the active environment's bin directory (venv or conda), if any.
+_py_manager_env_bin_dir() {
+    if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+        echo "$VIRTUAL_ENV/bin"
+        return 0
+    fi
+    if [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
+        echo "$CONDA_PREFIX/bin"
+        return 0
+    fi
+    return 1
+}
+
+_py_manager_file_size() {
+    local target="$1"
+    local size=""
+
+    size=$(command stat -f%z "$target" 2>/dev/null) || true
+    if [[ -z "$size" ]]; then
+        size=$(command stat -c%s "$target" 2>/dev/null) || true
+    fi
+
+    [[ "$size" == <-> ]] || size=0
+    echo "$size"
 }
 
 # Get the Python version used by current venv - with caching
@@ -268,14 +395,33 @@ _get_venv_python_version() {
     fi
     
     # For conda
-    if [[ -n "$CONDA_DEFAULT_ENV" ]] && command -v python >/dev/null 2>&1; then
-        ver=$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+    if [[ -n "${CONDA_PREFIX:-}" ]] && [[ -x "$CONDA_PREFIX/bin/python" ]]; then
+        ver=$("$CONDA_PREFIX/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
+        if [[ -n "$ver" ]]; then
+            echo "$ver"
+            return 0
+        fi
+    elif [[ -n "$CONDA_DEFAULT_ENV" ]] && command -v python >/dev/null 2>&1; then
+        ver=$(command python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
         if [[ -n "$ver" ]]; then
             echo "$ver"
             return 0
         fi
     fi
     
+    return 1
+}
+
+# Fast venv version check - doesn't run python, just reads pyvenv.cfg
+# Used in bypass mode where we need quick version checks
+_get_venv_version_fast() {
+    if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -f "$VIRTUAL_ENV/pyvenv.cfg" ]]; then
+        local full_ver=$(grep -E "^version\s*=" "$VIRTUAL_ENV/pyvenv.cfg" 2>/dev/null | sed 's/.*=\s*//' | tr -d ' ')
+        if [[ "$full_ver" =~ ^([0-9]+\.[0-9]+) ]]; then
+            echo "${match[1]}"
+            return 0
+        fi
+    fi
     return 1
 }
 
@@ -335,8 +481,9 @@ python() {
 
     # Priority 1: Virtual environment
     if _in_virtual_env; then
-        if [[ -x "$VIRTUAL_ENV/bin/python" ]]; then
-            "$VIRTUAL_ENV/bin/python" "$@"
+        local env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/python" ]]; then
+            "$env_bin_dir/python" "$@"
         else
             command python "$@"
         fi
@@ -374,34 +521,9 @@ python() {
             fi
         fi
 
-        _scan_all_pythons
-        if [[ -n "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" ]]; then
-            "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" "$@"
-            return $?
-        fi
-    fi
-    
-    # Priority 3: System fallback (if explicitly allowed AND override is set)
-    if [[ -n "$PYTHON_ALLOW_SYSTEM" ]] && [[ -n "$_PYTHON_OVERRIDE" ]]; then
-        # Still block pip even with system fallback
-        if [[ "$#" -ge 2 ]] && [[ "$1" == "-m" ]] && [[ "$2" == "pip" ]]; then
-            echo "Error: python -m pip is blocked outside virtual environments"
-            echo ""
-            echo "To use pip:"
-            echo "   1. Create a virtual environment and activate it"
-            echo "   2. Then use pip normally"
-            echo ""
-            echo "This prevents accidental system-wide package installations."
-            echo "Note: PYTHON_ALLOW_SYSTEM does NOT affect pip."
-            return 1
-        fi
-
-        # Use the setpy override for build tools
-        _scan_all_pythons
-        if [[ -n "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" ]]; then
-            "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" "$@"
-            return $?
-        fi
+        # _validate_python_override already scanned, path guaranteed to exist
+        "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" "$@"
+        return $?
     fi
     
     # Default: Show error
@@ -427,7 +549,6 @@ python() {
     echo "Options:"
     echo "   1. Create venv: python${_PYTHON_VERSIONS[-1]} -m venv [venv-projname] && source [venv-projname]/bin/activate"
     echo "   2. Set temporary default: setpy ${_PYTHON_VERSIONS[-1]}"
-    echo "   3. For build tools: setpy <version> && PYTHON_ALLOW_SYSTEM=1 your-build-command"
 
     return 1
 }
@@ -463,8 +584,9 @@ python3() {
 
     # Priority 1: Virtual environment
     if _in_virtual_env; then
-        if [[ -x "$VIRTUAL_ENV/bin/python3" ]]; then
-            "$VIRTUAL_ENV/bin/python3" "$@"
+        local env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/python3" ]]; then
+            "$env_bin_dir/python3" "$@"
         else
             command python3 "$@"
         fi
@@ -502,34 +624,9 @@ python3() {
             fi
         fi
 
-        _scan_all_pythons
-        if [[ -n "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" ]]; then
-            "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" "$@"
-            return $?
-        fi
-    fi
-
-    # Priority 3: System fallback (if explicitly allowed AND override is set)
-    if [[ -n "$PYTHON_ALLOW_SYSTEM" ]] && [[ -n "$_PYTHON_OVERRIDE" ]]; then
-        # Still block pip even with system fallback
-        if [[ "$#" -ge 2 ]] && [[ "$1" == "-m" ]] && [[ "$2" == "pip" ]]; then
-            echo "Error: python3 -m pip is blocked outside virtual environments"
-            echo ""
-            echo "To use pip:"
-            echo "   1. Create a virtual environment and activate it"
-            echo "   2. Then use pip normally"
-            echo ""
-            echo "This prevents accidental system-wide package installations."
-            echo "Note: PYTHON_ALLOW_SYSTEM does NOT affect pip."
-            return 1
-        fi
-
-        # Use the setpy override for build tools
-        _scan_all_pythons
-        if [[ -n "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" ]]; then
-            "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" "$@"
-            return $?
-        fi
+        # _validate_python_override already scanned, path guaranteed to exist
+        "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" "$@"
+        return $?
     fi
     
     # Default: Show error
@@ -555,7 +652,6 @@ python3() {
     echo "Options:"
     echo "   1. Create venv: python${_PYTHON_VERSIONS[-1]} -m venv [venv-projname] && source [venv-projname]/bin/activate"
     echo "   2. Set temporary default: setpy ${_PYTHON_VERSIONS[-1]}"
-    echo "   3. For build tools: setpy <version> && PYTHON_ALLOW_SYSTEM=1 your-build-command"
 
     return 1
 }
@@ -582,8 +678,9 @@ pip() {
     fi
 
     if _in_virtual_env; then
-        if [[ -x "$VIRTUAL_ENV/bin/pip" ]]; then
-            "$VIRTUAL_ENV/bin/pip" "$@"
+        local env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/pip" ]]; then
+            "$env_bin_dir/pip" "$@"
         else
             command pip "$@"
         fi
@@ -638,8 +735,9 @@ pip3() {
     fi
 
     if _in_virtual_env; then
-        if [[ -x "$VIRTUAL_ENV/bin/pip3" ]]; then
-            "$VIRTUAL_ENV/bin/pip3" "$@"
+        local env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/pip3" ]]; then
+            "$env_bin_dir/pip3" "$@"
         else
             command pip3 "$@"
         fi
@@ -682,6 +780,9 @@ setpy() {
 
     local version=""
     local build_mode=0
+    local quiet=0
+
+    [[ -n "${PYMANAGER_QUIET:-}" ]] && quiet=1
 
     # Parse arguments
     for arg in "$@"; do
@@ -708,19 +809,29 @@ setpy() {
                 done
                 echo ""
                 echo "This sets a temporary default so 'python' and 'python3' work without a venv."
-                echo "Also creates ~/.local/bin/python symlink for AI tool compatibility."
+                echo "Exports PYTHON/PYTHON3 env vars for AI tool compatibility (no symlinks)."
                 echo ""
                 echo "Build mode (--build):"
                 echo "   Temporarily allows pip/pip3 outside virtual environments."
                 echo "   Use for building modules that require pip install."
                 echo "   WARNING: Can pollute system packages - use sparingly!"
+                echo "   Auto-clears in new shell sessions."
                 return 0
                 ;;
             --build)
                 build_mode=1
                 ;;
+            --quiet|--silent)
+                quiet=1
+                ;;
             clear|reset)
                 version="clear"
+                ;;
+            latest|auto)
+                # Pick the newest installed Python version automatically
+                if [[ -z "$version" ]]; then
+                    version="latest"
+                fi
                 ;;
             *)
                 # It's a version number
@@ -735,38 +846,42 @@ setpy() {
     if [[ "$version" == "clear" ]]; then
         local had_override=0
         local had_build_mode=0
-        
+
         [[ -n "$_PYTHON_OVERRIDE" ]] && had_override=1
         [[ $_PYTHON_BUILD_MODE -eq 1 ]] && had_build_mode=1
-        
+
         if [[ $had_override -eq 1 ]] || [[ $had_build_mode -eq 1 ]]; then
             if [[ $had_override -eq 1 ]]; then
-                echo "Cleared Python override (was ${_PYTHON_OVERRIDE})."
+                (( quiet )) || echo "Cleared Python override (was ${_PYTHON_OVERRIDE})."
                 _PYTHON_OVERRIDE=""
                 unset PYTHON PYTHON3
-            fi
-            
-            if [[ $had_build_mode -eq 1 ]]; then
-                echo "Cleared build mode (pip is now blocked outside venvs)."
-                _PYTHON_BUILD_MODE=0
-                unset PIP_REQUIRE_VIRTUALENV
-            fi
 
-            # Ask about symlinks
-            if [[ $_PYTHON_SYMLINK_MANAGED -eq 1 ]]; then
-                echo ""
-                echo -n "Remove ~/.local/bin/python symlinks? [y/N] "
-                read -r response
-                if [[ "$response" =~ ^[Yy]$ ]]; then
-                    rm -f "$_PYTHON_SYMLINK_DIR/python" "$_PYTHON_SYMLINK_DIR/python3" 2>/dev/null
-                    _PYTHON_SYMLINK_MANAGED=0
-                    echo "   Symlinks removed."
-                else
-                    echo "   Symlinks kept (pointing to previous version)."
+                # Clean up temp wrapper directory
+                if [[ -n "$_PYMANAGER_LAST_WRAPPER_DIR" ]] && [[ -d "$_PYMANAGER_LAST_WRAPPER_DIR" ]]; then
+                    rm -rf "$_PYMANAGER_LAST_WRAPPER_DIR" 2>/dev/null
+                    # Remove from PATH
+                    if [[ -n "${ZSH_VERSION:-}" ]]; then
+                        path=(${path:#"$_PYMANAGER_LAST_WRAPPER_DIR/bin"})
+                        export PATH="${(j/:/)path}"
+                    fi
+                    _PYMANAGER_LAST_WRAPPER_DIR=""
                 fi
             fi
+
+            if [[ $had_build_mode -eq 1 ]]; then
+                (( quiet )) || echo "Cleared build mode (pip is now blocked outside venvs)."
+                _PYTHON_BUILD_MODE=0
+                if (( _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET )); then
+                    export PIP_REQUIRE_VIRTUALENV="$_PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV"
+                else
+                    unset PIP_REQUIRE_VIRTUALENV
+                fi
+                _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
+                _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
+                unset PYMANAGER_BUILD_MODE PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
+            fi
         else
-            echo "No Python override or build mode is set."
+            (( quiet )) || echo "No Python override or build mode is set."
         fi
         return 0
     fi
@@ -810,6 +925,15 @@ setpy() {
     _PYTHONS_SCANNED=0
     _scan_all_pythons
 
+    # Resolve "latest"/"auto" to the newest available version
+    if [[ "$version" == "latest" ]]; then
+        if (( ${#_PYTHON_VERSIONS} == 0 )); then
+            echo "Error: No Python 3.x installations found on this system"
+            return 1
+        fi
+        version="${_PYTHON_VERSIONS[-1]}"
+    fi
+
     # Validate version exists
     if [[ -z "${_PYTHON_PATHS[$version]}" ]]; then
         echo "Error: Python ${version} not found on this system"
@@ -823,79 +947,174 @@ setpy() {
 
     local python_path="${_PYTHON_PATHS[$version]}"
 
+    # Prefer a real interpreter path for exports/symlinks (avoid self-referential symlink loops)
+    local python_target="$python_path"
+    if [[ -L "$python_target" ]]; then
+        local count=0
+        while [[ -L "$python_target" ]] && (( count++ < 50 )); do
+            local target
+            target=$(readlink "$python_target" 2>/dev/null) || break
+            [[ "$target" != /* ]] && target="${python_target:h}/$target"
+            python_target="$target"
+        done
+    fi
+
+    # If the stored path resolves to something non-executable (or a broken loop), fall back to pythonX.Y.
+    local stored_bin_dir="${python_path%/*}"
+    if [[ ! -x "$python_target" ]] && [[ -x "$stored_bin_dir/python${version}" ]]; then
+        python_target="$stored_bin_dir/python${version}"
+    fi
+
+    # SAFETY CHECK: Verify the binary is functional (not empty/corrupt)
+    local file_size=$(_py_manager_file_size "$python_target")
+    if [[ "$file_size" -eq 0 ]]; then
+        echo "Error: Python binary at $python_target is empty (0 bytes)!"
+        echo ""
+        echo "The file exists but appears to be corrupted."
+        echo "Please reinstall Python ${version}."
+        return 1
+    fi
+
+    # Verify it actually executes
+    local test_output
+    if ! test_output=$("$python_target" --version 2>&1); then
+        echo "Error: Python binary at $python_target failed to execute!"
+        echo ""
+        echo "Output: $test_output"
+        echo ""
+        echo "Please reinstall Python ${version}."
+        return 1
+    fi
+
     # Set shell override
     _PYTHON_OVERRIDE="$version"
 
-    # Export for subprocesses (AI tools)
-    export PYTHON="$python_path"
-    export PYTHON3="$python_path"
+    # Get the bin directory for this Python
+    local python_bin_dir="${python_target%/*}"
+
+    # Export for subprocesses (AI tools like Claude Code, Codex)
+    export PYTHON="$python_target"
+    export PYTHON3="$python_target"
+
+    # Create session-scoped temp wrapper scripts for subprocess compatibility
+    # This makes python/python3 available to subprocesses (Claude Code, Codex, etc.)
+    # without creating persistent symlinks
+    local wrapper_dir="/tmp/pymanager-$$"
+    mkdir -p "$wrapper_dir/bin" 2>/dev/null
+
+    # Create python wrapper
+    cat > "$wrapper_dir/bin/python" <<WRAPPER
+#!/bin/sh
+exec "$python_target" "\$@"
+WRAPPER
+    chmod +x "$wrapper_dir/bin/python"
+
+    # Create python3 wrapper
+    cat > "$wrapper_dir/bin/python3" <<WRAPPER
+#!/bin/sh
+exec "$python_target" "\$@"
+WRAPPER
+    chmod +x "$wrapper_dir/bin/python3"
+
+    # Also link the versioned python (e.g., python3.14)
+    ln -sf "$python_target" "$wrapper_dir/bin/python${version}" 2>/dev/null
+
+    # Update PATH: wrapper_dir first, then python_bin_dir (for pip3.X etc), then rest
+    # Keep active virtualenv/conda bins ahead of everything.
+    if [[ -n "${ZSH_VERSION:-}" ]]; then
+        local active_env_bin=""
+        if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+            active_env_bin="$VIRTUAL_ENV/bin"
+        elif [[ -n "${CONDA_PREFIX:-}" ]] && [[ -d "$CONDA_PREFIX/bin" ]]; then
+            active_env_bin="$CONDA_PREFIX/bin"
+        fi
+
+        local -a cleaned_path=()
+        local previous_wrapper_dir="${_PYMANAGER_LAST_WRAPPER_DIR:-}"
+        local previous_bin_dir="${_PYMANAGER_LAST_SET_BIN_DIR:-}"
+        local dir
+        for dir in $path; do
+            [[ "$dir" == "$wrapper_dir/bin" ]] && continue
+            [[ "$dir" == "$python_bin_dir" ]] && continue
+            [[ -n "$previous_wrapper_dir" ]] && [[ "$dir" == "$previous_wrapper_dir/bin" ]] && continue
+            [[ -n "$previous_bin_dir" ]] && [[ "$dir" == "$previous_bin_dir" ]] && continue
+            cleaned_path+=("$dir")
+        done
+
+        if [[ -n "$active_env_bin" ]] && (( ${cleaned_path[(I)$active_env_bin]} )); then
+            local -a new_path=()
+            local inserted=0
+            for dir in $cleaned_path; do
+                new_path+=("$dir")
+                if (( inserted == 0 )) && [[ "$dir" == "$active_env_bin" ]]; then
+                    new_path+=("$wrapper_dir/bin" "$python_bin_dir")
+                    inserted=1
+                fi
+            done
+            if (( inserted == 0 )); then
+                new_path=("$wrapper_dir/bin" "$python_bin_dir" $cleaned_path)
+            fi
+            path=($new_path)
+        else
+            path=("$wrapper_dir/bin" "$python_bin_dir" $cleaned_path)
+        fi
+        export PATH="${(j/:/)path}"
+        _PYMANAGER_LAST_WRAPPER_DIR="$wrapper_dir"
+        _PYMANAGER_LAST_SET_BIN_DIR="$python_bin_dir"
+    else
+        # Fallback for non-zsh
+        local cleaned_path="$PATH"
+        cleaned_path="${cleaned_path//:$wrapper_dir\/bin:/:}"
+        cleaned_path="${cleaned_path/#$wrapper_dir\/bin:/}"
+        cleaned_path="${cleaned_path/%:$wrapper_dir\/bin/}"
+        cleaned_path="${cleaned_path//:$python_bin_dir:/:}"
+        cleaned_path="${cleaned_path/#$python_bin_dir:/}"
+        cleaned_path="${cleaned_path/%:$python_bin_dir/}"
+        export PATH="$wrapper_dir/bin:$python_bin_dir:$cleaned_path"
+    fi
 
     # Handle build mode
     if [[ $build_mode -eq 1 ]]; then
+        if [[ $_PYTHON_BUILD_MODE -ne 1 ]]; then
+            _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=${+PIP_REQUIRE_VIRTUALENV}
+            _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV="${PIP_REQUIRE_VIRTUALENV-}"
+            export PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET="$_PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET"
+            export PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV="$_PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV"
+            export PYMANAGER_BUILD_MODE=1
+        fi
         _PYTHON_BUILD_MODE=1
         # This env var tells pip it's okay to run outside venv (for subprocesses)
         export PIP_REQUIRE_VIRTUALENV=0
     fi
-
-    # Manage symlinks for AI tool PATH compatibility
-    _setup_python_symlinks "$python_path"
-
-    echo "Set temporary Python default to ${version}."
-    echo ""
-    echo "Binary: $python_path"
-    echo ""
-    echo "AI tool compatibility:"
-    echo "   PYTHON=$PYTHON"
-    echo "   ~/.local/bin/python -> $python_path"
-    
-    if [[ $_PYTHON_BUILD_MODE -eq 1 ]]; then
+    if (( ! quiet )); then
+        echo "Set Python ${version} for this session."
         echo ""
-        echo "┌─────────────────────────────────────────────────────────────┐"
-        echo "│  BUILD MODE ENABLED - pip/pip3 allowed outside venv        │"
-        echo "│  WARNING: This can install packages system-wide!           │"
-        echo "│  Run 'setpy clear' when done building.                     │"
-        echo "└─────────────────────────────────────────────────────────────┘"
-    else
+        echo "Binary: $python_target"
+        echo "Wrappers: $wrapper_dir/bin/"
         echo ""
-        echo "Note: pip remains blocked outside venvs. Use --build to allow."
-    fi
-    echo ""
-    echo "To clear: setpy clear"
+        echo "Subprocesses (Claude Code, Codex, etc.) will find:"
+        echo "   python, python3, python${version} → $python_target"
 
-    # Warn if in venv
-    if _in_virtual_env; then
+        if [[ $_PYTHON_BUILD_MODE -eq 1 ]]; then
+            echo ""
+            echo "┌─────────────────────────────────────────────────────────────┐"
+            echo "│  BUILD MODE ENABLED - pip/pip3 allowed outside venv        │"
+            echo "│  WARNING: This can install packages system-wide!           │"
+            echo "│  Run 'setpy clear' when done building.                     │"
+            echo "└─────────────────────────────────────────────────────────────┘"
+        else
+            echo ""
+            echo "Note: pip remains blocked outside venvs. Use --build to allow."
+        fi
         echo ""
-        echo "Warning: You're in a virtual environment, which takes precedence."
+        echo "To clear: setpy clear"
+
+        # Warn if in venv
+        if _in_virtual_env; then
+            echo ""
+            echo "Warning: You're in a virtual environment, which takes precedence."
+        fi
     fi
-
-    # Check PATH
-    if [[ ":$PATH:" != *":$_PYTHON_SYMLINK_DIR:"* ]]; then
-        echo ""
-        echo "Warning: $_PYTHON_SYMLINK_DIR is not in your PATH!"
-        echo "   Add to ~/.zshrc: export PATH=\"$_PYTHON_SYMLINK_DIR:\$PATH\""
-    fi
-}
-
-# Helper to manage symlinks for AI tool compatibility
-_setup_python_symlinks() {
-    local python_path="$1"
-
-    # Verify target exists
-    if [[ ! -x "$python_path" ]]; then
-        echo "Error: Target binary does not exist: $python_path"
-        return 1
-    fi
-
-    # Ensure directory exists
-    if [[ ! -d "$_PYTHON_SYMLINK_DIR" ]]; then
-        mkdir -p "$_PYTHON_SYMLINK_DIR"
-    fi
-
-    # Create/update symlinks
-    ln -sf "$python_path" "$_PYTHON_SYMLINK_DIR/python"
-    ln -sf "$python_path" "$_PYTHON_SYMLINK_DIR/python3"
-
-    _PYTHON_SYMLINK_MANAGED=1
 }
 
 # Validate that the override Python still exists
@@ -950,6 +1169,26 @@ _python_version_wrapper() {
     fi
 
     if _py_manager_should_bypass; then
+        # VENV ENFORCEMENT: Even in bypass mode, block pip with mismatched version
+        if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+            if [[ "$#" -ge 2 ]] && [[ "$1" == "-m" ]] && [[ "$2" == "pip" ]]; then
+                local venv_ver=$(_get_venv_version_fast)
+                if [[ -n "$venv_ver" ]] && [[ "$version" != "$venv_ver" ]]; then
+                    echo "Error: python${version} -m pip blocked - venv uses Python ${venv_ver}" >&2
+                    echo "" >&2
+                    echo "This would install to system Python ${version}, not your venv." >&2
+                    echo "Use 'python -m pip' or 'pip' instead." >&2
+                    return 1
+                fi
+                # Version matches - use venv's python to ensure correct sys.prefix
+                if [[ -x "$VIRTUAL_ENV/bin/python" ]]; then
+                    "$VIRTUAL_ENV/bin/python" "$@"
+                    return $?
+                fi
+            fi
+        fi
+
+        # Original bypass logic for non-pip operations
         if _py_manager_available; then
             _scan_all_pythons
             if [[ -n "${_PYTHON_PATHS[$version]}" ]]; then
@@ -965,13 +1204,15 @@ _python_version_wrapper() {
         command "python${version}" "$@"
         return $?
     fi
-    
+
     # If in venv, be more permissive
     if _in_virtual_env; then
-        # First, check if the requested python executable exists in the venv
-        if [[ -x "$VIRTUAL_ENV/bin/python${version}" ]]; then
+        local env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+
+        # First, check if the requested python executable exists in the active env
+        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/python${version}" ]]; then
             # It exists! Just use it directly
-            "$VIRTUAL_ENV/bin/python${version}" "$@"
+            "$env_bin_dir/python${version}" "$@"
             return $?
         fi
         
@@ -983,22 +1224,29 @@ _python_version_wrapper() {
             venv_version="${match[1]}"
         fi
         
-        if [[ "$version" == "$venv_version" ]]; then
-            # Fall back to the venv's python
-            if [[ -x "$VIRTUAL_ENV/bin/python" ]]; then
-                "$VIRTUAL_ENV/bin/python" "$@"
+        if [[ -n "$venv_version" ]] && [[ "$version" == "$venv_version" ]]; then
+            # Fall back to the env's python
+            if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/python" ]]; then
+                "$env_bin_dir/python" "$@"
                 return $?
             fi
-        else
-            # Only block if it truly doesn't exist and isn't the venv's version
-            echo "Error: python${version} is not available in this virtual environment"
-            echo ""
-            echo "This virtual environment uses Python ${venv_version}"
-            echo "   Available: python, python3, python${venv_version}"
-            echo ""
-            echo "To use a different Python version, deactivate first with: deactivate"
-            return 1
+            command python "$@"
+            return $?
         fi
+
+        # Only block if it truly doesn't exist and isn't the env's version
+        echo "Error: python${version} is not available in this environment"
+        echo ""
+        if [[ -n "$venv_version" ]]; then
+            echo "This environment uses Python ${venv_version}"
+            echo "   Available: python, python3, python${venv_version}"
+        else
+            echo "Unable to determine the active environment's Python version"
+            echo "   Available: python, python3"
+        fi
+        echo ""
+        echo "To use a different Python version, deactivate first with: deactivate"
+        return 1
     fi
 
     # Outside venv: ensure we have scanned for pythons
@@ -1051,6 +1299,24 @@ _pip_version_wrapper() {
     fi
 
     if _py_manager_should_bypass; then
+        # VENV ENFORCEMENT: Block mismatched pip versions even in bypass mode
+        if [[ -n "${VIRTUAL_ENV:-}" ]] && [[ -d "$VIRTUAL_ENV/bin" ]]; then
+            local venv_ver=$(_get_venv_version_fast)
+            if [[ -n "$venv_ver" ]] && [[ "$version" != "$venv_ver" ]]; then
+                echo "Error: pip${version} blocked - venv uses Python ${venv_ver}" >&2
+                echo "" >&2
+                echo "This would install to system Python ${version}, not your venv." >&2
+                echo "Use 'pip' or 'pip3' instead." >&2
+                return 1
+            fi
+            # Version matches - use venv's pip to ensure correct sys.prefix
+            if [[ -x "$VIRTUAL_ENV/bin/pip" ]]; then
+                "$VIRTUAL_ENV/bin/pip" "$@"
+                return $?
+            fi
+        fi
+
+        # Original bypass logic for outside venv
         if _py_manager_available; then
             _scan_all_pythons
             if [[ -n "${_PYTHON_PATHS[$version]}" ]]; then
@@ -1069,13 +1335,15 @@ _pip_version_wrapper() {
         command "pip${version}" "$@"
         return $?
     fi
-    
+
     # If in venv, be more permissive
     if _in_virtual_env; then
-        # First check if the requested pip executable exists in the venv
-        if [[ -x "$VIRTUAL_ENV/bin/pip${version}" ]]; then
+        local env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+
+        # First check if the requested pip executable exists in the active env
+        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/pip${version}" ]]; then
             # It exists! Just use it directly
-            "$VIRTUAL_ENV/bin/pip${version}" "$@"
+            "$env_bin_dir/pip${version}" "$@"
             return $?
         fi
         
@@ -1087,21 +1355,28 @@ _pip_version_wrapper() {
             venv_version="${match[1]}"
         fi
         
-        if [[ "$version" == "$venv_version" ]]; then
-            # Fall back to the venv's pip
-            if [[ -x "$VIRTUAL_ENV/bin/pip" ]]; then
-                "$VIRTUAL_ENV/bin/pip" "$@"
+        if [[ -n "$venv_version" ]] && [[ "$version" == "$venv_version" ]]; then
+            # Fall back to the env's pip
+            if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/pip" ]]; then
+                "$env_bin_dir/pip" "$@"
                 return $?
             fi
-        else
-            echo "Error: pip${version} is not available in this virtual environment"
-            echo ""
-            echo "This virtual environment uses Python ${venv_version}"
-            echo "   Available: pip, pip3, pip${venv_version}"
-            echo ""
-            echo "To use a different Python version, deactivate first with: deactivate"
-            return 1
+            command pip "$@"
+            return $?
         fi
+
+        echo "Error: pip${version} is not available in this environment"
+        echo ""
+        if [[ -n "$venv_version" ]]; then
+            echo "This environment uses Python ${venv_version}"
+            echo "   Available: pip, pip3, pip${venv_version}"
+        else
+            echo "Unable to determine the active environment's Python version"
+            echo "   Available: pip, pip3"
+        fi
+        echo ""
+        echo "To use a different Python version, deactivate first with: deactivate"
+        return 1
     fi
 
     # Build mode: allow pip with the specified version
@@ -1135,7 +1410,7 @@ _pip_version_wrapper() {
 # This range (3.8-3.25) should cover Python releases for many years to come
 for major in 3; do
     for minor in {8..25}; do
-        local ver="${major}.${minor}"
+        ver="${major}.${minor}"
         # Validate version format to prevent code injection via eval
         if [[ "$ver" =~ ^[0-9]+\.[0-9]+$ ]]; then
             eval "
@@ -1178,6 +1453,8 @@ pydiag() {
     echo "  CI=${CI:-<not set>}"
     echo "  CODEX_SANDBOX_NETWORK_DISABLED=${CODEX_SANDBOX_NETWORK_DISABLED:-<not set>}"
     echo "  VIRTUAL_ENV=${VIRTUAL_ENV:-<not set>}"
+    echo "  CONDA_PREFIX=${CONDA_PREFIX:-<not set>}"
+    echo "  CONDA_DEFAULT_ENV=${CONDA_DEFAULT_ENV:-<not set>}"
     echo "  SHLVL=$SHLVL"
     echo ""
     echo "Shell Properties:"
@@ -1227,9 +1504,9 @@ pydiag() {
     echo ""
 
     echo "Python Commands Available:"
-    echo "  python: $(type -p python 2>/dev/null || echo '<function/not found>')"
-    echo "  python3: $(type -p python3 2>/dev/null || echo '<function/not found>')"
-    echo "  pip: $(type -p pip 2>/dev/null || echo '<function/not found>')"
+    echo "  python: $(whence -p python 2>/dev/null || echo '<function/not found>')"
+    echo "  python3: $(whence -p python3 2>/dev/null || echo '<function/not found>')"
+    echo "  pip: $(whence -p pip 2>/dev/null || echo '<function/not found>')"
     echo ""
     echo "  Use 'pywhich python' to see what binary would actually run."
     echo ""
@@ -1243,32 +1520,15 @@ pydiag() {
     echo "  PYTHON3=${PYTHON3:-<not set>}"
     echo "  PIP_REQUIRE_VIRTUALENV=${PIP_REQUIRE_VIRTUALENV:-<not set>}"
     echo ""
-    
-    echo "Symlinks (for PATH-based discovery):"
-    if [[ -L "$_PYTHON_SYMLINK_DIR/python" ]]; then
-        echo "  $_PYTHON_SYMLINK_DIR/python -> $(readlink "$_PYTHON_SYMLINK_DIR/python")"
-    else
-        echo "  $_PYTHON_SYMLINK_DIR/python: NOT CREATED"
-    fi
-    if [[ -L "$_PYTHON_SYMLINK_DIR/python3" ]]; then
-        echo "  $_PYTHON_SYMLINK_DIR/python3 -> $(readlink "$_PYTHON_SYMLINK_DIR/python3")"
-    else
-        echo "  $_PYTHON_SYMLINK_DIR/python3: NOT CREATED"
-    fi
-    echo ""
-    
-    echo "PATH check for $_PYTHON_SYMLINK_DIR:"
-    if [[ ":$PATH:" == *":$_PYTHON_SYMLINK_DIR:"* ]]; then
-        echo "  ✓ $_PYTHON_SYMLINK_DIR is in PATH"
-    else
-        echo "  ✗ $_PYTHON_SYMLINK_DIR is NOT in PATH"
-        echo "    Add to ~/.zshrc: export PATH=\"$_PYTHON_SYMLINK_DIR:\$PATH\""
-    fi
+    echo "NOTE: Subprocesses do not inherit shell functions; they rely on PATH/ENV."
+    echo "      'setpy' exports PYTHON/PYTHON3 and updates PATH."
     echo ""
 
     echo "What subprocesses will see:"
     echo "  'python' command: $(command -v python 2>/dev/null || echo 'not found')"
     echo "  'python3' command: $(command -v python3 2>/dev/null || echo 'not found')"
+    echo "  PYTHON env var: ${PYTHON:-<not set>}"
+    echo "  PYTHON3 env var: ${PYTHON3:-<not set>}"
     echo ""
 
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1276,8 +1536,10 @@ pydiag() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     echo "If Codex CLI/Claude Code can't find Python:"
-    echo "   1. Run: setpy <version>  (creates symlinks + exports env vars)"
-    echo "   2. Ensure ~/.local/bin is first in PATH"
+    echo "   1. Run: setpy <version>  (exports PYTHON/PYTHON3 env vars)"
+    echo "   2. AI tools that respect these env vars will use the right Python"
+    echo "   3. For tools that only use PATH, add Python's bin dir to PATH:"
+    echo "      export PATH=\"/path/to/python/bin:\$PATH\""
     echo ""
     echo "If in a sandboxed environment and seeing errors:"
     echo "   1. Set: export PYTHON_MANAGER_FORCE_BYPASS=1"
@@ -1393,8 +1655,11 @@ pywhich() {
     fi
 
     if ! _py_manager_available; then
-        echo "Warning: Python manager not fully loaded"
-        return 1
+        # Fall back to command which if manager not fully loaded
+        for cmd in "$@"; do
+            command which "$cmd" 2>/dev/null || echo "$cmd: not found"
+        done
+        return $?
     fi
 
     _scan_all_pythons
@@ -1402,13 +1667,25 @@ pywhich() {
 
     for cmd in "$@"; do
         local result=""
+        local in_env=0
+        local env_bin_dir=""
+        if _in_virtual_env; then
+            in_env=1
+            env_bin_dir=$(_py_manager_env_bin_dir 2>/dev/null)
+        fi
 
         case "$cmd" in
             python|python3)
-                # Check venv first
-                if _in_virtual_env && [[ -x "$VIRTUAL_ENV/bin/$cmd" ]]; then
-                    result="$VIRTUAL_ENV/bin/$cmd"
-                # Check override
+                if (( in_env )); then
+                    if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/$cmd" ]]; then
+                        result="$env_bin_dir/$cmd"
+                    else
+                        result=$(whence -p "$cmd" 2>/dev/null)
+                    fi
+                    if [[ -z "$result" ]]; then
+                        result="(not found in environment)"
+                        had_error=1
+                    fi
                 elif [[ -n "$_PYTHON_OVERRIDE" ]] && [[ -n "${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}" ]]; then
                     result="${_PYTHON_PATHS[$_PYTHON_OVERRIDE]}"
                 else
@@ -1426,14 +1703,22 @@ pywhich() {
 
                 if [[ -n "$version" ]]; then
                     # Check venv first
-                    if _in_virtual_env; then
+                    if (( in_env )); then
                         local venv_version=$(_get_venv_python_version)
-                        if [[ "$version" == "$venv_version" ]] && [[ -x "$VIRTUAL_ENV/bin/python" ]]; then
-                            result="$VIRTUAL_ENV/bin/python"
-                        elif [[ -x "$VIRTUAL_ENV/bin/python${version}" ]]; then
-                            result="$VIRTUAL_ENV/bin/python${version}"
+                        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/python${version}" ]]; then
+                            result="$env_bin_dir/python${version}"
+                        elif [[ "$version" == "$venv_version" ]]; then
+                            if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/python" ]]; then
+                                result="$env_bin_dir/python"
+                            else
+                                result=$(whence -p python 2>/dev/null)
+                            fi
                         else
-                            result="(not available in venv - venv uses Python $venv_version)"
+                            result="(not available in env - env uses Python $venv_version)"
+                            had_error=1
+                        fi
+                        if [[ -z "$result" ]]; then
+                            result="(not found in environment)"
                             had_error=1
                         fi
                     elif [[ -n "${_PYTHON_PATHS[$version]}" ]]; then
@@ -1445,8 +1730,16 @@ pywhich() {
                 fi
                 ;;
             pip|pip3)
-                if _in_virtual_env && [[ -x "$VIRTUAL_ENV/bin/$cmd" ]]; then
-                    result="$VIRTUAL_ENV/bin/$cmd"
+                if (( in_env )); then
+                    if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/$cmd" ]]; then
+                        result="$env_bin_dir/$cmd"
+                    else
+                        result=$(whence -p "$cmd" 2>/dev/null)
+                    fi
+                    if [[ -z "$result" ]]; then
+                        result="(not found in environment)"
+                        had_error=1
+                    fi
                 else
                     result="(blocked outside venv)"
                     had_error=1
@@ -1458,14 +1751,22 @@ pywhich() {
                     version="${match[1]}"
                 fi
 
-                if [[ -n "$version" ]] && _in_virtual_env; then
+                if [[ -n "$version" ]] && (( in_env )); then
                     local venv_version=$(_get_venv_python_version)
-                    if [[ "$version" == "$venv_version" ]] && [[ -x "$VIRTUAL_ENV/bin/pip" ]]; then
-                        result="$VIRTUAL_ENV/bin/pip"
-                    elif [[ -x "$VIRTUAL_ENV/bin/pip${version}" ]]; then
-                        result="$VIRTUAL_ENV/bin/pip${version}"
+                    if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/pip${version}" ]]; then
+                        result="$env_bin_dir/pip${version}"
+                    elif [[ "$version" == "$venv_version" ]]; then
+                        if [[ -n "$env_bin_dir" ]] && [[ -x "$env_bin_dir/pip" ]]; then
+                            result="$env_bin_dir/pip"
+                        else
+                            result=$(whence -p pip 2>/dev/null)
+                        fi
                     else
-                        result="(not available in venv)"
+                        result="(not available in env)"
+                        had_error=1
+                    fi
+                    if [[ -z "$result" ]]; then
+                        result="(not found in environment)"
                         had_error=1
                     fi
                 else
@@ -1545,3 +1846,26 @@ which() {
 }
 
 (( _PYTHON_MANAGER_READY = 1 ))
+
+
+# Clear inherited build mode when starting a new interactive shell session.
+# This prevents "build mode" from leaking into child shells via exported env vars.
+if [[ -o interactive ]]; then
+  if [[ "${PYMANAGER_SESSION_PID:-}" != "$$" ]]; then
+    if [[ "${PYMANAGER_BUILD_MODE:-}" == "1" ]]; then
+      [[ -n "${PYMANAGER_DEBUG:-}" ]] && echo "[pymanager] Clearing inherited build mode for new shell session" >&2
+      _PYTHON_BUILD_MODE=0
+      _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET=0
+      _PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV=""
+
+      if [[ "${PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET:-0}" == "1" ]]; then
+        export PIP_REQUIRE_VIRTUALENV="${PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV}"
+      else
+        unset PIP_REQUIRE_VIRTUALENV
+      fi
+      unset PYMANAGER_BUILD_MODE PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV_SET PYMANAGER_SAVED_PIP_REQUIRE_VIRTUALENV
+    fi
+
+    export PYMANAGER_SESSION_PID="$$"
+  fi
+fi
