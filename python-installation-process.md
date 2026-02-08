@@ -36,16 +36,13 @@ cd Python-3.13.6
 ### 4 · Configure for an optimized, arm64-only, non-framework build under `~/opt`
 
 ```bash
-PREFIX="$HOME/opt/python/3.13.6"
+PREFIX="$HOME/opt/python/3.13.12"
 
 GDBM_CFLAGS="-I$(brew --prefix gdbm)/include" \
 GDBM_LIBS="-L$(brew --prefix gdbm)/lib -lgdbm" \
 ./configure \
   --prefix="$PREFIX" \
-  --enable-optimizations --with-lto \
-  --with-openssl="$(brew --prefix openssl@3)" \
-  --enable-shared \
-  --build=arm64-apple-darwin$(uname -r)
+  --enable-optimizations
 ```
 
 * `--enable-optimizations --with-lto` are the officially recommended flags for a PGO + LTO build ([Python Developer's Guide][3]).
